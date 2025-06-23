@@ -14,6 +14,7 @@ fun EditorScreen(encodedImageUri: String) {
 
     // The AsyncImage composable from the Coil library does all the hard work.
     // We just give it the 'model' (our imageUri) and it handles the rest.
+    // bug fix
     AsyncImage(
         model = imageUri,
         contentDescription = "Selected image for editing",
