@@ -53,7 +53,7 @@ class MainActivity : ComponentActivity() {
                 // We create the NavController here and store it in our variable.
                 val controller = rememberNavController()
                 this.navController = controller
-
+                // yy
                 // NavHost is the container that displays the current screen.
                 NavHost(navController = controller, startDestination = "home_screen") {
 
