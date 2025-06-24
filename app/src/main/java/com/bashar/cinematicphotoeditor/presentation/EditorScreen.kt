@@ -2,25 +2,33 @@ package com.bashar.cinematicphotoeditor.presentation
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.ColorMatrix
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Button
-import androidx.compose.material3.Text
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.outlined.FilterVintage
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
-import com.bashar.cinematicphotoeditor.domain.BitmapFilterer
 import com.bashar.cinematicphotoeditor.domain.HistogramCalculator
 import com.bashar.cinematicphotoeditor.domain.HistogramData
 import kotlinx.coroutines.Dispatchers
@@ -28,97 +36,137 @@ import kotlinx.coroutines.withContext
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import androidx.compose.ui.graphics.ColorMatrix as ComposeColorMatrix
+import android.graphics.ColorMatrix as AndroidColorMatrix
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EditorScreen(encodedImageUri: String) {
     val imageUri = Uri.parse(URLDecoder.decode(encodedImageUri, StandardCharsets.UTF_8.name()))
     val context = LocalContext.current
 
+    // --- State for all editor properties ---
+    var scale by remember { mutableStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var histogramData by remember { mutableStateOf<HistogramData?>(null) }
 
-    var contrastValue by remember { mutableStateOf(1.0f) }
-    var exposureValue by remember { mutableStateOf(0.0f) }
-    var activePresetMatrix by remember { mutableStateOf<ColorMatrix?>(null) }
+    // --- State for the filters panel ---
+    var showFiltersSheet by remember { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState()
+    val presets = remember { FilterLibrary.getPresets() }
+    var selectedPreset by remember { mutableStateOf(presets.first()) }
+    var filterIntensity by remember { mutableStateOf(100f) }
 
-    val finalAndroidMatrix = remember(activePresetMatrix, contrastValue, exposureValue) {
-        val matrix = activePresetMatrix?.let { ColorMatrix(it) } ?: ColorMatrix()
-        val contrastMatrix = ColorMatrix().apply { setScale(contrastValue, contrastValue, contrastValue, 1f) }
-        matrix.postConcat(contrastMatrix)
-        val exposureMatrix = ColorMatrix().apply {
-            val brightness = exposureValue * 255
-            set(floatArrayOf(1f, 0f, 0f, 0f, brightness, 0f, 1f, 0f, 0f, brightness, 0f, 0f, 1f, 0f, brightness, 0f, 0f, 0f, 1f, 0f))
+
+    // --- ADVANCED BLENDING LOGIC ---
+    val finalColorFilter = remember(selectedPreset, filterIntensity) {
+        val filterMatrix = selectedPreset.matrix
+        val identityMatrix = AndroidColorMatrix()
+        val interpolatedValues = FloatArray(20)
+        for (i in 0..19) {
+            interpolatedValues[i] = identityMatrix.array[i] + (filterMatrix.array[i] - identityMatrix.array[i]) * (filterIntensity / 100f)
         }
-        matrix.postConcat(exposureMatrix)
-        matrix
+        val finalMatrix = AndroidColorMatrix(interpolatedValues)
+        ColorFilter.colorMatrix(ComposeColorMatrix(finalMatrix.array))
     }
 
-    val finalColorFilter = remember(finalAndroidMatrix) { ColorFilter.colorMatrix(ComposeColorMatrix(finalAndroidMatrix.array)) }
-
-    LaunchedEffect(finalAndroidMatrix) {
-        // Real-time update with no delay, as requested
-        originalBitmap?.let {
-            withContext(Dispatchers.Default) {
-                val filteredBitmap = BitmapFilterer.applyColorMatrix(it, finalAndroidMatrix)
-                val newHistogramData = HistogramCalculator.calculate(filteredBitmap)
-                withContext(Dispatchers.Main) {
-                    histogramData = newHistogramData
-                }
-            }
-        }
-    }
-
+    // Load the bitmap and calculate the initial histogram
     LaunchedEffect(imageUri) {
         withContext(Dispatchers.IO) {
             val bitmap = loadBitmapFromUri(imageUri, context)
-            if(bitmap != null) {
+            if (bitmap != null) {
                 originalBitmap = bitmap
-                val initialHistogram = HistogramCalculator.calculate(bitmap)
-                withContext(Dispatchers.Main) {
-                    histogramData = initialHistogram
-                }
+                histogramData = HistogramCalculator.calculate(bitmap)
             }
         }
     }
 
-    val blackAndWhiteMatrix = ColorMatrix().apply { setSaturation(0f) }
-    val vintageMatrix = ColorMatrix(floatArrayOf(0.393f, 0.769f, 0.189f, 0f, 0f, 0.349f, 0.686f, 0.168f, 0f, 0f, 0.272f, 0.534f, 0.131f, 0f, 0f, 0f, 0f, 0f, 1f, 0f))
-    val cinematicMatrix = ColorMatrix(floatArrayOf(1.0f, 0.0f, 0.0f, 0.0f, -10f, 0.0f, 0.9f, 0.1f, 0.0f, 0f, 0.1f, 0.2f, 0.7f, 0.0f, 10f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f))
-    val studioMatrix = ColorMatrix().apply { val scale = 1.2f; setScale(scale, scale, scale, 1f) }
+    val transformableState = rememberTransformableState { zoomChange, offsetChange, _ ->
+        val newScale = (scale * zoomChange).coerceIn(1f, 5f)
+        val maxOffset = (containerSize.width * (newScale - 1) / 2f) to (containerSize.height * (newScale - 1) / 2f)
+        val newOffset = (offset + offsetChange).let { Offset(x = it.x.coerceIn(-maxOffset.first, maxOffset.first), y = it.y.coerceIn(-maxOffset.second, maxOffset.second)) }
+        scale = newScale
+        offset = newOffset
+    }
 
-    val presets = listOf(FilterPreset("None"), FilterPreset("B&W"), FilterPreset("Vintage"), FilterPreset("Cinematic"), FilterPreset("Studio"))
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-            AsyncImage(
-                model = imageUri,
-                contentDescription = "Image Preview",
-                modifier = Modifier.fillMaxSize(),
-                colorFilter = finalColorFilter,
-                // --- THE FIX IS HERE ---
-                // Using ContentScale.Crop to ensure it fills the screen
-                contentScale = ContentScale.Crop
-            )
-        }
-        HistogramView(histogramData = histogramData)
-        Column(modifier = Modifier.padding(vertical = 4.dp)) {
-            AdjustmentSlider(label = "Contrast", value = contrastValue, valueRange = 0.5f..1.5f, onValueChange = { contrastValue = it })
-            AdjustmentSlider(label = "Exposure", value = exposureValue, valueRange = -0.5f..0.5f, onValueChange = { exposureValue = it })
-            Button(onClick = { contrastValue = 1.0f; exposureValue = 0.0f }, modifier = Modifier.padding(top = 4.dp).align(Alignment.CenterHorizontally)) {
-                Text("Reset Adjustments")
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = showFiltersSheet,
+                    onClick = { showFiltersSheet = true },
+                    icon = { Icon(Icons.Outlined.FilterVintage, contentDescription = "Filters") },
+                    label = { Text("Filters") }
+                )
+                NavigationBarItem(
+                    selected = false,
+                    onClick = { /* TODO: Show adjust panel */ },
+                    icon = { Icon(Icons.Default.Tune, contentDescription = "Adjust") },
+                    label = { Text("Adjust") }
+                )
             }
         }
-        LazyRow(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalArrangement = Arrangement.Center) {
-            items(presets) { preset ->
-                PresetItem(preset = preset, onPresetClick = { selectedPreset ->
-                    activePresetMatrix = when (selectedPreset.name) {
-                        "B&W" -> blackAndWhiteMatrix
-                        "Vintage" -> vintageMatrix
-                        "Cinematic" -> cinematicMatrix
-                        "Studio" -> studioMatrix
-                        else -> null
+    ) { paddingValues ->
+        Box(
+            modifier = Modifier
+                .padding(paddingValues)
+                .fillMaxSize()
+                .clipToBounds()
+                .onSizeChanged { containerSize = it }
+        ) {
+            AsyncImage(
+                model = imageUri,
+                contentDescription = "Image to Edit",
+                contentScale = ContentScale.Fit,
+                colorFilter = finalColorFilter,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                        translationX = offset.x
+                        translationY = offset.y
                     }
-                })
+                    .transformable(state = transformableState)
+            )
+
+            HistogramView(
+                histogramData = histogramData,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(16.dp)
+                    .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                    .padding(0.dp)
+                    .fillMaxWidth(0.5f)
+                    .height(120.dp)
+            )
+
+            if (showFiltersSheet) {
+                ModalBottomSheet(
+                    onDismissRequest = { showFiltersSheet = false },
+                    sheetState = sheetState
+                ) {
+                    FiltersPanel(
+                        presets = presets,
+                        selectedPreset = selectedPreset,
+                        onPresetClick = { preset ->
+                            selectedPreset = preset
+                            if(preset.name != "None") {
+                                filterIntensity = 100f
+                            }
+                        },
+                        intensity = filterIntensity,
+                        onIntensityChange = { intensity ->
+                            filterIntensity = intensity
+                        },
+                        // --- THIS IS THE FIX ---
+                        // We are now passing the reset action correctly
+                        onResetIntensity = {
+                            filterIntensity = 100f
+                        }
+                    )
+                }
             }
         }
     }

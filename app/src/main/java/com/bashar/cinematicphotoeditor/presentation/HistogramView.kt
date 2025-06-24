@@ -1,11 +1,9 @@
 package com.bashar.cinematicphotoeditor.presentation
 
 import android.graphics.Color
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.bashar.cinematicphotoeditor.domain.HistogramData
 import com.github.mikephil.charting.charts.LineChart
@@ -14,13 +12,18 @@ import com.github.mikephil.charting.data.LineData
 import com.github.mikephil.charting.data.LineDataSet
 
 @Composable
-fun HistogramView(histogramData: HistogramData?) {
-    if (histogramData == null) return // Don't show anything if there's no data
+fun HistogramView(
+    histogramData: HistogramData?,
+    modifier: Modifier = Modifier // The modifier parameter is now correctly added
+) {
+    if (histogramData == null) {
+        // You can return a placeholder or an empty composable if there's no data yet
+        return
+    }
 
     AndroidView(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(150.dp),
+        // The passed-in modifier is now used here
+        modifier = modifier,
         factory = { context ->
             LineChart(context).apply {
                 // Basic chart setup
@@ -33,7 +36,6 @@ fun HistogramView(histogramData: HistogramData?) {
             }
         },
         update = { chart ->
-            // This block updates the chart with new data
             val redEntries = histogramData.red.mapIndexed { index, value -> Entry(index.toFloat(), value.toFloat()) }
             val greenEntries = histogramData.green.mapIndexed { index, value -> Entry(index.toFloat(), value.toFloat()) }
             val blueEntries = histogramData.blue.mapIndexed { index, value -> Entry(index.toFloat(), value.toFloat()) }
