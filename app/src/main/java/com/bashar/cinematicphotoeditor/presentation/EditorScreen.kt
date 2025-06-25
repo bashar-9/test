@@ -6,12 +6,17 @@ import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.FilterVintage
 import androidx.compose.material3.*
@@ -23,11 +28,13 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.navigation.NavController
 import coil.compose.AsyncImage
 import com.bashar.cinematicphotoeditor.domain.HistogramCalculator
 import com.bashar.cinematicphotoeditor.domain.HistogramData
@@ -38,40 +45,81 @@ import java.nio.charset.StandardCharsets
 import androidx.compose.ui.graphics.ColorMatrix as ComposeColorMatrix
 import android.graphics.ColorMatrix as AndroidColorMatrix
 
+// An enum to keep track of which panel is currently open
+private enum class ActivePanel {
+    NONE, FILTERS, ADJUST
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun EditorScreen(encodedImageUri: String) {
+fun EditorScreen(encodedImageUri: String, navController: NavController) {
     val imageUri = Uri.parse(URLDecoder.decode(encodedImageUri, StandardCharsets.UTF_8.name()))
     val context = LocalContext.current
 
-    // --- State for all editor properties ---
+    // --- State for which panel is open ---
+    var activePanel by remember { mutableStateOf(ActivePanel.NONE) }
+
+    // --- State for editor properties ---
     var scale by remember { mutableStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var histogramData by remember { mutableStateOf<HistogramData?>(null) }
+    var isPreviewingOriginal by remember { mutableStateOf(false) }
 
-    // --- State for the filters panel ---
-    var showFiltersSheet by remember { mutableStateOf(false) }
-    val sheetState = rememberModalBottomSheetState()
+    // --- State for Filters Panel ---
     val presets = remember { FilterLibrary.getPresets() }
     var selectedPreset by remember { mutableStateOf(presets.first()) }
     var filterIntensity by remember { mutableStateOf(100f) }
 
+    // --- NEW: State for Adjustments Panel ---
+    val adjustmentTools = remember { AdjustmentTools.getTools() }
+    var selectedTool by remember { mutableStateOf<AdjustmentTool?>(null) }
+    // A map to hold the current value for each adjustment slider
+    var adjustmentValues by remember { mutableStateOf<Map<String, Float>>(
+        adjustmentTools.associate { it.name to it.initialValue }
+    ) }
 
-    // --- ADVANCED BLENDING LOGIC ---
-    val finalColorFilter = remember(selectedPreset, filterIntensity) {
-        val filterMatrix = selectedPreset.matrix
-        val identityMatrix = AndroidColorMatrix()
-        val interpolatedValues = FloatArray(20)
-        for (i in 0..19) {
-            interpolatedValues[i] = identityMatrix.array[i] + (filterMatrix.array[i] - identityMatrix.array[i]) * (filterIntensity / 100f)
+
+    // --- The Final Combined ColorMatrix Logic ---
+    val finalColorFilter = remember(selectedPreset, filterIntensity, adjustmentValues, isPreviewingOriginal) {
+        if (isPreviewingOriginal) {
+            null // Show original on long press
+        } else {
+            // Start with the interpolated preset matrix
+            val presetMatrix = selectedPreset.matrix
+            val identityMatrix = AndroidColorMatrix()
+            val interpolatedValues = FloatArray(20)
+            for (i in 0..19) {
+                interpolatedValues[i] = identityMatrix.array[i] + (presetMatrix.array[i] - identityMatrix.array[i]) * (filterIntensity / 100f)
+            }
+            val finalMatrix = AndroidColorMatrix(interpolatedValues)
+
+            // Now, layer on each manual adjustment
+            // Contrast
+            val contrast = adjustmentValues["Contrast"] ?: 1.0f
+            val contrastMatrix = AndroidColorMatrix().apply { setScale(contrast, contrast, contrast, 1f) }
+            finalMatrix.postConcat(contrastMatrix)
+
+            // Exposure
+            val exposure = adjustmentValues["Exposure"] ?: 0.0f
+            val exposureMatrix = AndroidColorMatrix().apply {
+                val brightness = exposure * 255
+                set(floatArrayOf(1f,0f,0f,0f,brightness, 0f,1f,0f,0f,brightness, 0f,0f,1f,0f,brightness, 0f,0f,0f,1f,0f))
+            }
+            finalMatrix.postConcat(exposureMatrix)
+
+            // Saturation
+            val saturation = adjustmentValues["Saturation"] ?: 1.0f
+            val saturationMatrix = AndroidColorMatrix().apply{ setSaturation(saturation) }
+            finalMatrix.postConcat(saturationMatrix)
+
+            // TODO: Add logic for Shadows, Highlights, etc. here later
+
+            ColorFilter.colorMatrix(ComposeColorMatrix(finalMatrix.array))
         }
-        val finalMatrix = AndroidColorMatrix(interpolatedValues)
-        ColorFilter.colorMatrix(ComposeColorMatrix(finalMatrix.array))
     }
 
-    // Load the bitmap and calculate the initial histogram
     LaunchedEffect(imageUri) {
         withContext(Dispatchers.IO) {
             val bitmap = loadBitmapFromUri(imageUri, context)
@@ -91,82 +139,97 @@ fun EditorScreen(encodedImageUri: String) {
     }
 
     Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Edit") },
+                navigationIcon = {
+                    IconButton(onClick = { navController.popBackStack() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    Button(onClick = { /* TODO: Implement save logic */ }) {
+                        Text("Save")
+                    }
+                }
+            )
+        },
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(
-                    selected = showFiltersSheet,
-                    onClick = { showFiltersSheet = true },
+                    selected = activePanel == ActivePanel.FILTERS,
+                    onClick = { activePanel = if (activePanel == ActivePanel.FILTERS) ActivePanel.NONE else ActivePanel.FILTERS },
                     icon = { Icon(Icons.Outlined.FilterVintage, contentDescription = "Filters") },
                     label = { Text("Filters") }
                 )
                 NavigationBarItem(
-                    selected = false,
-                    onClick = { /* TODO: Show adjust panel */ },
+                    selected = activePanel == ActivePanel.ADJUST,
+                    onClick = { activePanel = if (activePanel == ActivePanel.ADJUST) ActivePanel.NONE else ActivePanel.ADJUST },
                     icon = { Icon(Icons.Default.Tune, contentDescription = "Adjust") },
                     label = { Text("Adjust") }
                 )
             }
         }
     ) { paddingValues ->
-        Box(
-            modifier = Modifier
-                .padding(paddingValues)
-                .fillMaxSize()
-                .clipToBounds()
-                .onSizeChanged { containerSize = it }
-        ) {
-            AsyncImage(
-                model = imageUri,
-                contentDescription = "Image to Edit",
-                contentScale = ContentScale.Fit,
-                colorFilter = finalColorFilter,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                        translationX = offset.x
-                        translationY = offset.y
-                    }
-                    .transformable(state = transformableState)
-            )
-
-            HistogramView(
-                histogramData = histogramData,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(16.dp)
-                    .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
-                    .padding(0.dp)
-                    .fillMaxWidth(0.5f)
-                    .height(120.dp)
-            )
-
-            if (showFiltersSheet) {
-                ModalBottomSheet(
-                    onDismissRequest = { showFiltersSheet = false },
-                    sheetState = sheetState
-                ) {
-                    FiltersPanel(
-                        presets = presets,
-                        selectedPreset = selectedPreset,
-                        onPresetClick = { preset ->
-                            selectedPreset = preset
-                            if(preset.name != "None") {
-                                filterIntensity = 100f
+        Column(modifier = Modifier.padding(paddingValues).fillMaxSize()) {
+            Box(
+                modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds()
+                    .onSizeChanged { containerSize = it }
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onPress = {
+                                isPreviewingOriginal = true
+                                try { awaitRelease() } finally { isPreviewingOriginal = false }
                             }
-                        },
-                        intensity = filterIntensity,
-                        onIntensityChange = { intensity ->
-                            filterIntensity = intensity
-                        },
-                        // --- THIS IS THE FIX ---
-                        // We are now passing the reset action correctly
-                        onResetIntensity = {
-                            filterIntensity = 100f
+                        )
+                    }
+            ) {
+                AsyncImage(
+                    model = imageUri,
+                    contentDescription = "Image to Edit",
+                    contentScale = ContentScale.Fit,
+                    colorFilter = finalColorFilter,
+                    modifier = Modifier.fillMaxSize().graphicsLayer {
+                        scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y
+                    }.transformable(state = transformableState)
+                )
+                HistogramView(
+                    histogramData = histogramData,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                        .padding(8.dp).fillMaxWidth(0.4f).height(120.dp)
+                )
+            }
+
+            AnimatedVisibility(visible = activePanel == ActivePanel.FILTERS, enter = slideInVertically(initialOffsetY = { it }), exit = slideOutVertically(targetOffsetY = { it })) {
+                FiltersPanel(
+                    presets = presets, selectedPreset = selectedPreset,
+                    onPresetClick = { preset ->
+                        selectedPreset = preset
+                        if(preset.name != "None") { filterIntensity = 100f }
+                    },
+                    intensity = filterIntensity,
+                    onIntensityChange = { intensity -> filterIntensity = intensity },
+                    onResetIntensity = { filterIntensity = 100f }
+                )
+            }
+
+            AnimatedVisibility(visible = activePanel == ActivePanel.ADJUST, enter = slideInVertically(initialOffsetY = { it }), exit = slideOutVertically(targetOffsetY = { it })) {
+                AdjustmentsPanel(
+                    tools = adjustmentTools,
+                    selectedTool = selectedTool,
+                    onToolClick = { tool -> selectedTool = tool },
+                    adjustmentValues = adjustmentValues,
+                    onAdjustmentChange = { toolName, newValue ->
+                        adjustmentValues = adjustmentValues.toMutableMap().apply { this[toolName] = newValue }
+                    },
+                    onResetAdjustment = { toolName ->
+                        val initialValue = adjustmentTools.find { it.name == toolName }?.initialValue
+                        if(initialValue != null) {
+                            adjustmentValues = adjustmentValues.toMutableMap().apply { this[toolName] = initialValue }
                         }
-                    )
-                }
+                    }
+                )
             }
         }
     }
