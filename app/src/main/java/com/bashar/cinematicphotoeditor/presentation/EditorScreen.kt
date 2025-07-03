@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
@@ -31,6 +32,7 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
@@ -46,11 +48,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import kotlin.math.max
 import androidx.compose.ui.graphics.ColorMatrix as ComposeColorMatrix
 import android.graphics.ColorMatrix as AndroidColorMatrix
 
 private enum class ActivePanel {
     NONE, FILTERS, ADJUST
+}
+
+private enum class PanelContent {
+    Filters, Adjust
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -60,7 +67,6 @@ fun EditorScreen(encodedImageUri: String, navController: NavController) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    // --- State for editor properties ---
     var activePanel by remember { mutableStateOf(ActivePanel.NONE) }
     var scale by remember { mutableStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
@@ -68,32 +74,43 @@ fun EditorScreen(encodedImageUri: String, navController: NavController) {
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var histogramData by remember { mutableStateOf<HistogramData?>(null) }
     var isPreviewingOriginal by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
 
-    // --- State for Filters Panel ---
     val presets = remember { FilterLibrary.getPresets() }
     var selectedPreset by remember { mutableStateOf(presets.first()) }
     var filterIntensity by remember { mutableStateOf(100f) }
 
-    // --- State for Adjustments Panel ---
     val adjustmentTools = remember { AdjustmentTools.getTools() }
     var selectedTool by remember { mutableStateOf<AdjustmentTool?>(null) }
     var adjustmentValues by remember { mutableStateOf<Map<String, Float>>(adjustmentTools.associate { it.name to it.initialValue }) }
 
-    // --- NEW: State for loading indicator during save ---
-    var isSaving by remember { mutableStateOf(false) }
+    var showDiscardDialog by remember { mutableStateOf(false) }
+    var showSaveDialog by remember { mutableStateOf(false) }
 
+    val isEdited by remember {
+        derivedStateOf {
+            val isFilterApplied = selectedPreset.name != "None"
+            val areAdjustmentsMade = adjustmentValues.any { (key, value) ->
+                val tool = adjustmentTools.find { it.name == key }
+                tool != null && value != tool.initialValue
+            }
+            isFilterApplied || areAdjustmentsMade
+        }
+    }
 
-    // --- The Final Combined ColorMatrix Logic ---
     val finalAndroidMatrix = remember(selectedPreset, filterIntensity, adjustmentValues) {
-        // We only calculate the matrix once here
+        val finalMatrix = AndroidColorMatrix() // Start with an identity matrix
+
+        // --- FILTER PRESET LOGIC ---
         val presetMatrix = selectedPreset.matrix
         val identityMatrix = AndroidColorMatrix()
         val interpolatedValues = FloatArray(20)
         for (i in 0..19) {
             interpolatedValues[i] = identityMatrix.array[i] + (presetMatrix.array[i] - identityMatrix.array[i]) * (filterIntensity / 100f)
         }
-        val finalMatrix = AndroidColorMatrix(interpolatedValues)
+        finalMatrix.postConcat(AndroidColorMatrix(interpolatedValues))
 
+        // --- ADJUSTMENTS LOGIC ---
         val contrast = adjustmentValues["Contrast"] ?: 1.0f
         val contrastMatrix = AndroidColorMatrix().apply { setScale(contrast, contrast, contrast, 1f) }
         finalMatrix.postConcat(contrastMatrix)
@@ -109,13 +126,37 @@ fun EditorScreen(encodedImageUri: String, navController: NavController) {
         val saturationMatrix = AndroidColorMatrix().apply{ setSaturation(saturation) }
         finalMatrix.postConcat(saturationMatrix)
 
+        // --- NEW: TEMPERATURE LOGIC ---
+        val temperature = (adjustmentValues["Temperature"] ?: 0.0f)
+        if (temperature != 0f) {
+            // Add warmth (red) and reduce coolness (blue)
+            val redTint = temperature * 25
+            val blueTint = temperature * -25
+            val temperatureMatrix = AndroidColorMatrix(floatArrayOf(
+                1f, 0f, 0f, 0f, redTint,
+                0f, 1f, 0f, 0f, 0f,
+                0f, 0f, 1f, 0f, blueTint,
+                0f, 0f, 0f, 1f, 0f
+            ))
+            finalMatrix.postConcat(temperatureMatrix)
+        }
+
         finalMatrix
     }
 
-    // The ColorFilter for the UI is derived from the final matrix
     val finalColorFilter = remember(finalAndroidMatrix, isPreviewingOriginal) {
         if (isPreviewingOriginal) null else ColorFilter.colorMatrix(ComposeColorMatrix(finalAndroidMatrix.array))
     }
+
+    val onBackPress: () -> Unit = {
+        if (isEdited) {
+            showDiscardDialog = true
+        } else {
+            navController.popBackStack()
+        }
+    }
+
+    BackHandler(onBack = onBackPress)
 
     LaunchedEffect(imageUri) {
         withContext(Dispatchers.IO) {
@@ -139,35 +180,11 @@ fun EditorScreen(encodedImageUri: String, navController: NavController) {
         topBar = {
             TopAppBar(
                 title = { Text("Edit") },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
+                navigationIcon = { IconButton(onClick = onBackPress) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
                 actions = {
-                    // --- UPDATED: Save Button Logic ---
                     Button(
-                        onClick = {
-                            coroutineScope.launch {
-                                isSaving = true
-                                val bitmapToSave = originalBitmap
-                                if (bitmapToSave != null) {
-                                    val savedSuccessfully = withContext(Dispatchers.IO) {
-                                        // Apply the final edits and save the image
-                                        val finalBitmap = BitmapFilterer.applyColorMatrix(bitmapToSave, finalAndroidMatrix)
-                                        ImageSaver.saveBitmap(context, finalBitmap, "EditedImage")
-                                    }
-                                    if (savedSuccessfully) {
-                                        Toast.makeText(context, "Image saved successfully!", Toast.LENGTH_SHORT).show()
-                                        navController.popBackStack()
-                                    } else {
-                                        Toast.makeText(context, "Error saving image", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                                isSaving = false
-                            }
-                        },
-                        enabled = !isSaving // Disable button while saving
+                        enabled = isEdited && !isSaving,
+                        onClick = { showSaveDialog = true }
                     ) {
                         if (isSaving) {
                             CircularProgressIndicator(modifier = Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary)
@@ -187,7 +204,10 @@ fun EditorScreen(encodedImageUri: String, navController: NavController) {
     ) { paddingValues ->
         Column(modifier = Modifier.padding(paddingValues).fillMaxSize()) {
             Box(
-                modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .clipToBounds()
                     .onSizeChanged { containerSize = it }
                     .pointerInput(Unit) { detectTapGestures(onPress = { isPreviewingOriginal = true; try { awaitRelease() } finally { isPreviewingOriginal = false } }) }
             ) {
@@ -195,18 +215,132 @@ fun EditorScreen(encodedImageUri: String, navController: NavController) {
                     model = imageUri, contentDescription = "Image to Edit", contentScale = ContentScale.Fit, colorFilter = finalColorFilter,
                     modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y }.transformable(state = transformableState)
                 )
-                HistogramView(
-                    histogramData = histogramData,
-                    modifier = Modifier.align(Alignment.TopEnd).padding(16.dp).background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(8.dp)).padding(8.dp).fillMaxWidth(0.4f).height(120.dp)
-                )
+//                HistogramView(
+//                    histogramData = histogramData,
+//                    modifier = Modifier.align(Alignment.TopEnd).padding(16.dp).background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(8.dp)).padding(8.dp).fillMaxWidth(0.4f).height(120.dp)
+//                )
             }
-            AnimatedVisibility(visible = activePanel == ActivePanel.FILTERS, enter = slideInVertically(initialOffsetY = { it }), exit = slideOutVertically(targetOffsetY = { it })) {
-                FiltersPanel(presets = presets, selectedPreset = selectedPreset, onPresetClick = { preset -> selectedPreset = preset; if(preset.name != "None") { filterIntensity = 100f } }, intensity = filterIntensity, onIntensityChange = { intensity -> filterIntensity = intensity }, onResetIntensity = { filterIntensity = 100f })
-            }
-            AnimatedVisibility(visible = activePanel == ActivePanel.ADJUST, enter = slideInVertically(initialOffsetY = { it }), exit = slideOutVertically(targetOffsetY = { it })) {
-                AdjustmentsPanel(tools = adjustmentTools, selectedTool = selectedTool, onToolClick = { tool -> selectedTool = tool }, adjustmentValues = adjustmentValues, onAdjustmentChange = { toolName, newValue -> adjustmentValues = adjustmentValues.toMutableMap().apply { this[toolName] = newValue } }, onResetAdjustment = { toolName -> val initialValue = adjustmentTools.find { it.name == toolName }?.initialValue; if(initialValue != null) { adjustmentValues = adjustmentValues.toMutableMap().apply { this[toolName] = initialValue } } })
+
+            AnimatedVisibility(
+                visible = activePanel != ActivePanel.NONE,
+                enter = slideInVertically(initialOffsetY = { it }),
+                exit = slideOutVertically(targetOffsetY = { it })
+            ) {
+                SubcomposeLayout { constraints ->
+                    val filtersPlaceable = subcompose(PanelContent.Filters) {
+                        FiltersPanel(
+                            originalBitmap = originalBitmap,
+                            presets = presets,
+                            selectedPreset = selectedPreset,
+                            onPresetClick = { preset -> selectedPreset = preset; if (preset.name != "None") { filterIntensity = 100f } },
+                            intensity = filterIntensity,
+                            onIntensityChange = { intensity -> filterIntensity = intensity },
+                            onResetIntensity = { filterIntensity = 100f }
+                        )
+                    }.first().measure(constraints)
+
+                    val adjustmentsPlaceable = subcompose(PanelContent.Adjust) {
+                        AdjustmentsPanel(
+                            tools = adjustmentTools,
+                            selectedTool = selectedTool,
+                            onToolClick = { tool -> selectedTool = tool },
+                            adjustmentValues = adjustmentValues,
+                            onAdjustmentChange = { toolName, newValue -> adjustmentValues = adjustmentValues.toMutableMap().apply { this[toolName] = newValue } },
+                            onResetAdjustment = { toolName ->
+                                val initialValue = adjustmentTools.find { it.name == toolName }?.initialValue
+                                if (initialValue != null) {
+                                    adjustmentValues = adjustmentValues.toMutableMap().apply { this[toolName] = initialValue }
+                                }
+                            }
+                        )
+                    }.first().measure(constraints)
+
+                    val maxHeight = max(filtersPlaceable.height, adjustmentsPlaceable.height)
+
+                    layout(constraints.maxWidth, maxHeight) {
+                        when (activePanel) {
+                            ActivePanel.FILTERS -> filtersPlaceable.placeRelative(0, 0)
+                            ActivePanel.ADJUST -> adjustmentsPlaceable.placeRelative(0, 0)
+                            ActivePanel.NONE -> {}
+                        }
+                    }
+                }
             }
         }
+    }
+
+    if (showDiscardDialog) {
+        AlertDialog(
+            onDismissRequest = { showDiscardDialog = false },
+            title = { Text("Discard Changes?") },
+            text = { Text("If you go back now, you will lose all your edits.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDiscardDialog = false
+                        navController.popBackStack()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Discard")
+                }
+            },
+            dismissButton = {
+                Button(onClick = { showDiscardDialog = false }) {
+                    Text("Keep Editing")
+                }
+            }
+        )
+    }
+
+    if (showSaveDialog) {
+        AlertDialog(
+            onDismissRequest = { showSaveDialog = false },
+            title = { Text("Save Image") },
+            text = { Text("This will save a new, edited copy of your image to your gallery.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showSaveDialog = false
+                        coroutineScope.launch {
+                            isSaving = true
+                            try {
+                                val success = originalBitmap?.let { bitmapToSave ->
+                                    withContext(Dispatchers.IO) {
+                                        val finalBitmap = BitmapFilterer.applyColorMatrix(bitmapToSave, finalAndroidMatrix)
+                                        val fileName = "EditedImage_${System.currentTimeMillis()}"
+                                        ImageSaver.saveBitmap(context, finalBitmap, fileName)
+                                    }
+                                } ?: false
+
+                                withContext(Dispatchers.Main) {
+                                    if (success) {
+                                        Toast.makeText(context, "Image saved successfully!", Toast.LENGTH_SHORT).show()
+                                        navController.popBackStack()
+                                    } else {
+                                        Toast.makeText(context, "Error: Could not save image.", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                withContext(Dispatchers.Main) {
+                                    Toast.makeText(context, "An unexpected error occurred.", Toast.LENGTH_SHORT).show()
+                                }
+                                e.printStackTrace()
+                            } finally {
+                                isSaving = false
+                            }
+                        }
+                    }
+                ) {
+                    Text("Save a Copy")
+                }
+            },
+            dismissButton = {
+                Button(onClick = { showSaveDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
